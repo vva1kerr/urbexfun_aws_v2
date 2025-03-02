@@ -1,0 +1,15 @@
+streamlit
+folium
+streamlit_folium
+geocoder
+plotly
+python-dotenv
+rasterio
+matplotlib
+shapely
+ridge_map
+opencv_python
+pandas
+tqdm
+boto3
+psutil

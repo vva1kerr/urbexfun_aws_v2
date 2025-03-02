@@ -1,0 +1,15 @@
+.env
+__pycache__
+Procfile
+
+src/database/create_db
+src/tiff_processing/
+
+venv/
+
+data/city_coordinates.csv
+data/city_ip.csv
+data/city_zipcodes.csv 
+data/population_all_cities_2024.csv 
+
+.streamlit/secrets.toml
