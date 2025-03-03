@@ -1,75 +1,106 @@
-import boto3
 import os
 from pathlib import Path
-import tempfile
-from botocore.exceptions import ClientError
 import streamlit as st
 import time
 import dotenv
+import psutil
+import threading
+from typing import Optional
+import rasterio
+from rasterio.io import MemoryFile
+import numpy as np
 
+class ResourceManager:
+    def __init__(self, memory_limit_mb: Optional[float] = None):
+        """
+        Initialize resource manager with optional memory limit.
+        If no limit provided, uses 75% of system memory.
+        """
+        self.system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
+        self.memory_limit = memory_limit_mb or self.system_memory * 0.75
+        self.lock = threading.Lock()
+        self._cleanup_threshold = self.memory_limit * 0.9  # 90% of limit
+        
+    def get_available_memory(self) -> float:
+        """Get available memory in MB"""
+        return psutil.virtual_memory().available / (1024 * 1024)
+    
+    def get_used_memory(self) -> float:
+        """Get current process memory usage in MB"""
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    
+    def check_memory(self) -> bool:
+        """
+        Check if memory usage is within limits.
+        Returns True if memory is OK, False if we're over limit.
+        """
+        with self.lock:
+            used = self.get_used_memory()
+            if used > self.memory_limit:
+                return False
+            return True
+    
+    def estimate_tiff_memory(self, file_size_mb: float, processing_factor: float = 2.5) -> float:
+        """
+        Estimate memory needed for TIFF processing.
+        processing_factor accounts for temporary copies during processing.
+        """
+        return file_size_mb * processing_factor
+    
+    def can_process_file(self, file_size_mb: float) -> tuple[bool, float]:
+        """
+        Check if we can process a file of given size.
+        Returns (can_process, recommended_downsample_factor)
+        """
+        estimated_memory = self.estimate_tiff_memory(file_size_mb)
+        available_memory = self.get_available_memory()
+        
+        if estimated_memory < available_memory * 0.8:  # Leave 20% buffer
+            return True, 1
+        
+        # Calculate downsample factor needed
+        downsample_factor = int(np.ceil(np.sqrt(estimated_memory / (available_memory * 0.8))))
+        return False, max(2, downsample_factor)  # Minimum downsample factor of 2
 
 class S3Handler:
     def __init__(self, bucket_name, region_name):
         if not bucket_name:
             raise ValueError("bucket_name must be provided")
             
-        # Get AWS credentials from environment variables
-        aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
-        aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-        
-        if not aws_access_key_id or not aws_secret_access_key:
-            raise ValueError("AWS credentials not found in environment variables")
-            
-        self.s3_client = boto3.client(
-            's3',
-            region_name=region_name,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key
-        )
-        
         self.bucket_name = bucket_name
-        self.temp_dir = Path(tempfile.gettempdir()) / 'tiff_cache'
-        self.temp_dir.mkdir(exist_ok=True)
+        self.mount_point = Path("/home/ubuntu/s3bucket")
         
-        # st.write("Debug:", {
-        #     "AWS_BUCKET_NAME": bucket_name,
-        #     "AWS_REGION_NAME": region_name,
-        #     "Has AWS Access Key": bool(aws_access_key_id),
-        #     "Has AWS Secret Key": bool(aws_secret_access_key)
-        # })
-        
-    def download_tiff(self, tiff_key):
-        """
-        Download a TIFF file from S3 to local temp storage.
-        Returns the path to the local file.
-        """
-        local_path = self.temp_dir / Path(tiff_key).name
-        
-        # Check if file already exists in temp storage
-        if local_path.exists():
-            return str(local_path)
+        # Verify mount point exists
+        if not self.mount_point.exists():
+            raise RuntimeError(f"Mount point {self.mount_point} does not exist")
             
-        try:
-            self.s3_client.download_file(
-                self.bucket_name,
-                tiff_key,
-                str(local_path)
-            )
-            return str(local_path)
-        except ClientError as e:
-            print(f"Error downloading file from S3: {e}")
-            return None
-            
+        # Initialize resource manager
+        self.resource_manager = ResourceManager()
+        
     def get_tiff_path(self, lat, lon):
         """
         Get the local path to the TIFF file for given coordinates.
-        Downloads from S3 if not in local cache.
+        Returns tuple of (path, recommended_downsample_factor)
         """
         tiff_key = self.get_tiff_key(lat, lon)
         if not tiff_key:
-            return None
+            return None, 1
             
-        return self.download_tiff(tiff_key)
+        file_path = self.mount_point / tiff_key
+        
+        # Check if file exists
+        if not file_path.exists():
+            st.error(f"File not found at {file_path}")
+            return None, 1
+            
+        # Get file size and check if we need downsampling
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        _, downsample = self.resource_manager.can_process_file(file_size_mb)
+        
+        if downsample > 1:
+            st.warning(f"Large file detected ({file_size_mb:.1f}MB). Using downsampling factor {downsample}x")
+            
+        return str(file_path), downsample
         
     def get_tiff_key(self, lat, lon):
         """
@@ -101,15 +132,17 @@ class S3Handler:
         
         return filename
 
-    def cleanup_temp_files(self, max_age_hours=24):
+    def clamp_bounds(self, requested_bounds, tiff_bounds):
         """
-        Clean up old temporary files
+        Clamp requested bounds to stay within TIFF file bounds.
+        Returns tuple of (min_lon, min_lat, max_lon, max_lat)
         """
-        current_time = time.time()
-        for temp_file in self.temp_dir.glob('*.tif'):
-            file_age = current_time - os.path.getmtime(temp_file)
-            if file_age > max_age_hours * 3600:
-                temp_file.unlink()
+        min_lon = max(min(requested_bounds[0], requested_bounds[2]), tiff_bounds.left)
+        max_lon = min(max(requested_bounds[0], requested_bounds[2]), tiff_bounds.right)
+        min_lat = max(min(requested_bounds[1], requested_bounds[3]), tiff_bounds.bottom)
+        max_lat = min(max(requested_bounds[1], requested_bounds[3]), tiff_bounds.top)
+        
+        return (min_lon, min_lat, max_lon, max_lat)
 
 class S3MountHandler:
     mount_point = os.getenv('MOUNT_POINT')

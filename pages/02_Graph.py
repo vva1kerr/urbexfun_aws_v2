@@ -47,8 +47,8 @@ load_dotenv()
 
 # Initialize S3 handler at the top of the file, after imports
 s3_handler = S3Handler(
-    bucket_name=os.getenv('AWS_BUCKET_NAME'),
-    region_name=os.getenv('AWS_REGION_NAME')
+    bucket_name="urbexfun",  # This is just a placeholder now since we're using mounted filesystem
+    region_name="us-east-2"   # This is just a placeholder now since we're using mounted filesystem
 )
 
 st.title("Topography Viewer")
@@ -150,7 +150,7 @@ else:  # Single Point with Scale
         )
         
         # Get TIFF file based on view bounds center point
-        tiff_path = s3_handler.get_tiff_path(lat, lon)
+        tiff_path, downsample_factor = s3_handler.get_tiff_path(lat, lon)
         
         if not tiff_path:
             st.error("Could not find TIFF file for the given coordinates")
@@ -166,16 +166,12 @@ else:  # Single Point with Scale
         
         # Debug output
         st.write("Debug Info:", {
-            "Environment Variables": {
-                "AWS_BUCKET_NAME": os.getenv('AWS_BUCKET_NAME'),
-                "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
-                "Has AWS Access Key": bool(os.getenv('AWS_ACCESS_KEY_ID')),
-                "Has AWS Secret Key": bool(os.getenv('AWS_SECRET_ACCESS_KEY'))
-            },
+            "Mount Point": "/home/ubuntu/s3bucket",
             "Input Point": f"({lat}°N, {lon}°W)",
             "Scale": f"{scale}°",
             "Selected TIFF": tiff_path,
-            "View Bounds": view_bounds
+            "View Bounds": view_bounds,
+            "Downsample Factor": downsample_factor
         })
 
 # Add this helper function near the top of the file
@@ -216,12 +212,8 @@ def load_and_downsample_tiff(tiff_path, downsample_factor=2):
             data = np.squeeze(data)
             
             # Debug information
-            st.write("Debug - Data shape:", data.shape)
-            st.write("Debug - Data type:", data.dtype)
-            
-            # Verify 2D shape
-            if len(data.shape) != 2:
-                raise ValueError(f"Expected 2D array, got shape {data.shape}")
+            st.write(f"Data loaded with shape: {data.shape}, using downsample factor: {downsample_factor}")
+            st.write(f"Memory usage after load: {get_memory_usage():.1f}MB")
             
             return data, src.bounds
     except Exception as e:
@@ -288,6 +280,79 @@ def downsample_for_3d(data, max_points=200000):
         return data[::reduction_factor, ::reduction_factor]
     return data
 
+def create_dem_plot(data, bounds, title=None):
+    """Create DEM plot with memory optimization"""
+    try:
+        # Create figure with reasonable size
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Create the plot with terrain colormap
+        im = ax.imshow(data, 
+                      cmap='terrain',
+                      extent=[bounds.left, bounds.right, 
+                             bounds.bottom, bounds.top])
+        
+        # Add colorbar
+        plt.colorbar(im, ax=ax, label='Elevation (meters)')
+        
+        # Set title and labels
+        if title:
+            ax.set_title(title)
+        
+        # Format axis labels
+        ax.xaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
+        ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')
+        
+        # Clean up
+        plt.tight_layout()
+        
+        return fig
+        
+    except Exception as e:
+        st.error(f"Error creating DEM plot: {str(e)}")
+        return None
+
+def create_3d_plot(data, bounds):
+    """Create 3D terrain plot with memory optimization"""
+    try:
+        # Create coordinate meshgrid
+        y = np.linspace(bounds.bottom, bounds.top, data.shape[0])
+        x = np.linspace(bounds.left, bounds.right, data.shape[1])
+        X, Y = np.meshgrid(x, y)
+        
+        # Create 3D surface plot
+        fig = go.Figure(data=[
+            go.Surface(
+                z=data,
+                x=X,
+                y=Y,
+                colorscale='earth',
+                name='Elevation'
+            )
+        ])
+
+        fig.update_layout(
+            title='3D Terrain View',
+            scene=dict(
+                xaxis_title='Longitude',
+                yaxis_title='Latitude',
+                zaxis_title='Elevation (m)',
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.2)
+                )
+            ),
+            width=600,
+            height=600
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.error(f"Error creating 3D plot: {str(e)}")
+        return None
+
 # Process location data and select appropriate TIFF file(s)
 if location_data:
     try:
@@ -297,198 +362,154 @@ if location_data:
         # Get TIFF file based on the view bounds center point
         center_lat = (requested_bounds[1] + requested_bounds[3]) / 2
         center_lon = (requested_bounds[0] + requested_bounds[2]) / 2
-        tiff_path = s3_handler.get_tiff_path(center_lat, center_lon)
+        tiff_path, downsample_factor = s3_handler.get_tiff_path(center_lat, center_lon)
             
         if not tiff_path:
             st.error("Could not find TIFF file for the given coordinates")
             st.stop()
 
         # Check memory before processing
-        if check_memory_threshold(1600):  # 1600MB threshold
-            st.error("Insufficient memory available. Please try a smaller area or wait a moment.")
-            st.stop()
-            
-        with rasterio.open(tiff_path) as src:
-            st.write("Debug:", {
-                "Using TIFF file": tiff_path,
-                "TIFF bounds": src.bounds,
-                "Requested bounds": requested_bounds
-            })
-            
-            # Create progress bar for all graphs
-            progress_bar = st.progress(0)
-            st.write("Generating visualizations...")
-            total_graphs = 6
-            graphs_completed = 0
-            
-            # Create two columns for the layout
-            dem_col1, dem_col2 = st.columns(2)
-            
-            # Original DEM and ridge plot
-            with dem_col1:
-                st.subheader("Original DEM")
-                # Use the entire file range instead of bounding box
-                out_image = src.read(1)  # Read the entire file
-                
-                # Display original DEM using full file bounds
-                fig_dem, ax_dem = plt.subplots(figsize=(10, 10))
-                im = ax_dem.imshow(out_image, 
-                          cmap='terrain',
-                          extent=[src.bounds.left, src.bounds.right, 
-                                 src.bounds.bottom, src.bounds.top])
-                plt.colorbar(im, ax=ax_dem, label='Elevation (meters)')
-                center_lat = (src.bounds.top + src.bounds.bottom) / 2
-                center_lon = (src.bounds.right + src.bounds.left) / 2
-                ax_dem.set_title(f'Full Region\n{format_coordinates(center_lat, center_lon)}')
-                ax_dem.xaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
-                ax_dem.yaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
-                ax_dem.set_xlabel('Longitude')
-                ax_dem.set_ylabel('Latitude')
-                st.pyplot(fig_dem)
-                plt.close(fig_dem)
-                graphs_completed += 1
-                progress_bar.progress(graphs_completed/total_graphs)
+        current_memory = get_memory_usage()
+        st.sidebar.write(f"Current Memory Usage: {current_memory:.1f}MB")
+        
+        # Load and process the TIFF file with dynamic downsampling
+        data, bounds = load_and_downsample_tiff(tiff_path, downsample_factor=downsample_factor)
+        
+        # Update progress
+        progress_bar = st.progress(0)
+        total_graphs = 6  # Total number of visualizations (3 original + 3 adjusted)
+        graphs_completed = 0
 
-                # Display ridge plot
-                st.subheader("Ridge Plot")
-                fig_ridge = create_ridge_plot_optimized(out_image, f"Selected Region\n{format_coordinates(center_lat, center_lon)}")
-                if fig_ridge:
-                    st.pyplot(fig_ridge)
-                    plt.close(fig_ridge)
-                graphs_completed += 1
-                progress_bar.progress(graphs_completed/total_graphs)
+        # Create visualizations with memory checks between each
+        if data is not None:
+            try:
+                # Create two columns for the layout
+                col1, col2 = st.columns(2)
                 
-                # Add 3D surface plot
-                st.subheader("3D Terrain View")
-                # Downsample data for 3D plot
-                plot_data = downsample_for_3d(out_image)
-                
-                # Create coordinate meshgrid
-                y = np.linspace(src.bounds.bottom, src.bounds.top, plot_data.shape[0])
-                x = np.linspace(src.bounds.left, src.bounds.right, plot_data.shape[1])
-                X, Y = np.meshgrid(x, y)
-                
-                # Create 3D surface plot
-                fig_3d = go.Figure(data=[
-                    go.Surface(
-                        z=plot_data,
-                        x=X,
-                        y=Y,
-                        colorscale='earth',
-                        name='Elevation'
-                    )
-                ])
-
-                fig_3d.update_layout(
-                    title=f'3D Terrain View - Full Region',
-                    scene=dict(
-                        xaxis_title='Longitude',
-                        yaxis_title='Latitude',
-                        zaxis_title='Elevation (m)',
-                        camera=dict(
-                            eye=dict(x=1.5, y=1.5, z=1.2)
-                        )
-                    ),
-                    width=600,
-                    height=600
-                )
-
-                st.plotly_chart(fig_3d, key="original_3d")
-                graphs_completed += 1
-                progress_bar.progress(graphs_completed/total_graphs)
-
-            # Adjusted DEM and ridge plot
-            with dem_col2:
-                st.subheader("Adjusted DEM")
-                # Create bounding box and get adjusted image
-                adjusted_bounds = clamp_bounds(requested_bounds, src.bounds)
-                bbox = box(*adjusted_bounds)
-                try:
-                    out_image, out_transform = mask(src, [bbox], crop=True)
-                    
-                    # Display adjusted DEM
-                    fig_adj_dem, ax_adj_dem = plt.subplots(figsize=(10, 10))
-                    im = ax_adj_dem.imshow(out_image[0], 
-                                          cmap='terrain',
-                                          extent=[adjusted_bounds[0], adjusted_bounds[2],  # longitude (min to max)
-                                                 adjusted_bounds[1], adjusted_bounds[3]])  # latitude (min to max)
-                    plt.colorbar(im, ax=ax_adj_dem, label='Elevation (meters)')
-                    adj_center_lat = (adjusted_bounds[3] + adjusted_bounds[1]) / 2
-                    adj_center_lon = (adjusted_bounds[2] + adjusted_bounds[0]) / 2
-                    ax_adj_dem.set_title(f'Adjusted Region\n{format_coordinates(adj_center_lat, adj_center_lon)}')
-                    
-                    # Format axis labels with degree symbols
-                    ax_adj_dem.set_xlabel('Longitude (°W)')
-                    ax_adj_dem.set_ylabel('Latitude (°N)')
-                    
-                    # Set axis formatters to show degrees
-                    ax_adj_dem.xaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
-                    ax_adj_dem.yaxis.set_major_formatter(plt.FormatStrFormatter('%.2f°'))
-                    
-                    # Optional: Set axis limits explicitly to ensure correct range
-                    ax_adj_dem.set_xlim(adjusted_bounds[0], adjusted_bounds[2])
-                    ax_adj_dem.set_ylim(adjusted_bounds[1], adjusted_bounds[3])
-                    
-                    st.pyplot(fig_adj_dem)
-                    plt.close(fig_adj_dem)
+                with col1:
+                    st.subheader("Original Region")
+                    # Original DEM plot
+                    fig_dem = create_dem_plot(data, bounds, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
+                    if fig_dem:
+                        st.pyplot(fig_dem)
+                        plt.close(fig_dem)
                     graphs_completed += 1
                     progress_bar.progress(graphs_completed/total_graphs)
                     
-                    # Display adjusted ridge plot
-                    st.subheader("Adjusted Ridge Plot")
-                    fig_adj_ridge = create_ridge_plot_optimized(out_image[0], f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
-                    if fig_adj_ridge:
-                        st.pyplot(fig_adj_ridge)
-                        plt.close(fig_adj_ridge)
+                    # Check memory after each visualization
+                    if not s3_handler.resource_manager.check_memory():
+                        st.warning("High memory usage detected. Some visualizations may be skipped.")
+                        gc.collect()
+                    
+                    # Ridge plot
+                    fig_ridge = create_ridge_plot_optimized(data, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
+                    if fig_ridge:
+                        st.pyplot(fig_ridge)
+                        plt.close(fig_ridge)
                     graphs_completed += 1
                     progress_bar.progress(graphs_completed/total_graphs)
                     
-                    # Add 3D surface plot for adjusted region
-                    st.subheader("3D Terrain View")
-                    # Downsample data for 3D plot
-                    plot_data = downsample_for_3d(out_image[0])
-
-                    # Create coordinate meshgrid for adjusted region
-                    y = np.linspace(adjusted_bounds[1], adjusted_bounds[3], plot_data.shape[0])
-                    x = np.linspace(adjusted_bounds[0], adjusted_bounds[2], plot_data.shape[1])
-                    X, Y = np.meshgrid(x, y)
+                    # Check memory again
+                    if not s3_handler.resource_manager.check_memory():
+                        st.warning("High memory usage detected. 3D visualization may be limited.")
+                        gc.collect()
                     
-                    # Create 3D surface plot
-                    fig_adj_3d = go.Figure(data=[
-                        go.Surface(
-                            z=plot_data,
-                            x=X,
-                            y=Y,
-                            colorscale='earth',
-                            name='Elevation'
-                        )
-                    ])
-
-                    fig_adj_3d.update_layout(
-                        title=f'3D Terrain View - Adjusted Region',
-                        scene=dict(
-                            xaxis_title='Longitude',
-                            yaxis_title='Latitude',
-                            zaxis_title='Elevation (m)',
-                            camera=dict(
-                                eye=dict(x=1.5, y=1.5, z=1.2)
-                            )
-                        ),
-                        width=600,
-                        height=600
-                    )
-
-                    st.plotly_chart(fig_adj_3d, key="adjusted_3d")
-                    graphs_completed += 1
-                    progress_bar.progress(graphs_completed/total_graphs)
-                except ValueError as e:
-                    st.error(f"Could not create adjusted view: {str(e)}")
-                    st.write("The requested view area may be outside the available data")
-                    graphs_completed += 3  # Skip the remaining adjusted plots
-                    progress_bar.progress(graphs_completed/total_graphs)
-
-            # Clear progress bar when done
-            progress_bar.empty()
+                    # 3D surface plot
+                    plot_data = downsample_for_3d(data)
+                    if s3_handler.resource_manager.check_memory():
+                        fig_3d = create_3d_plot(plot_data, bounds)
+                        if fig_3d:
+                            st.plotly_chart(fig_3d)
+                        graphs_completed += 1
+                        progress_bar.progress(graphs_completed/total_graphs)
+                    else:
+                        st.warning("Insufficient memory for 3D visualization.")
+                
+                # Create adjusted view based on requested bounds
+                with col2:
+                    st.subheader("Selected Region")
+                    try:
+                        # Create bounding box and get adjusted image
+                        adjusted_bounds = clamp_bounds(requested_bounds, bounds)
+                        bbox = box(*adjusted_bounds)
+                        
+                        # Calculate center of adjusted region
+                        adj_center_lat = (adjusted_bounds[3] + adjusted_bounds[1]) / 2
+                        adj_center_lon = (adjusted_bounds[2] + adjusted_bounds[0]) / 2
+                        
+                        # Re-open the TIFF file to use mask operation
+                        with rasterio.open(tiff_path) as src:
+                            # Get adjusted image using mask operation
+                            out_image, out_transform = mask(src, [bbox], crop=True)
+                            
+                            if out_image.size > 0:
+                                # Create a bounds object for the adjusted region
+                                adjusted_bounds_obj = type('Bounds', (), {
+                                    'left': adjusted_bounds[0],
+                                    'right': adjusted_bounds[2],
+                                    'bottom': adjusted_bounds[1],
+                                    'top': adjusted_bounds[3]
+                                })
+                                
+                                # Adjusted DEM plot
+                                fig_adj_dem = create_dem_plot(out_image[0], 
+                                                            adjusted_bounds_obj,
+                                                            f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
+                                if fig_adj_dem:
+                                    st.pyplot(fig_adj_dem)
+                                    plt.close(fig_adj_dem)
+                                graphs_completed += 1
+                                progress_bar.progress(graphs_completed/total_graphs)
+                                
+                                # Check memory
+                                if not s3_handler.resource_manager.check_memory():
+                                    st.warning("High memory usage detected. Some visualizations may be skipped.")
+                                    gc.collect()
+                                
+                                # Adjusted ridge plot
+                                fig_adj_ridge = create_ridge_plot_optimized(out_image[0], 
+                                                                          f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
+                                if fig_adj_ridge:
+                                    st.pyplot(fig_adj_ridge)
+                                    plt.close(fig_adj_ridge)
+                                graphs_completed += 1
+                                progress_bar.progress(graphs_completed/total_graphs)
+                                
+                                # Check memory
+                                if not s3_handler.resource_manager.check_memory():
+                                    st.warning("High memory usage detected. 3D visualization may be limited.")
+                                    gc.collect()
+                                
+                                # Adjusted 3D plot
+                                plot_data = downsample_for_3d(out_image[0])
+                                if s3_handler.resource_manager.check_memory():
+                                    fig_adj_3d = create_3d_plot(plot_data, adjusted_bounds_obj)
+                                    if fig_adj_3d:
+                                        st.plotly_chart(fig_adj_3d)
+                                    graphs_completed += 1
+                                    progress_bar.progress(graphs_completed/total_graphs)
+                                else:
+                                    st.warning("Insufficient memory for 3D visualization.")
+                            else:
+                                st.error("Selected region is outside the available data range")
+                                graphs_completed += 3  # Skip the remaining adjusted plots
+                                progress_bar.progress(graphs_completed/total_graphs)
+                                
+                    except Exception as e:
+                        st.error(f"Error creating adjusted views: {str(e)}")
+                        st.write("Debug - Adjusted bounds:", adjusted_bounds)
+                        st.write("Debug - Data shape:", data.shape if 'data' in locals() else "No data loaded")
+                        graphs_completed += 3  # Skip the remaining adjusted plots
+                        progress_bar.progress(graphs_completed/total_graphs)
+                
+                # Final cleanup
+                gc.collect()
+                
+            except Exception as e:
+                st.error(f"Error processing visualizations: {str(e)}")
+        
+        # Clear progress bar when done
+        progress_bar.empty()
 
     except Exception as e:
         st.error(f"Error processing data: {str(e)}")
