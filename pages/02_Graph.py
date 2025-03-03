@@ -189,9 +189,13 @@ def clamp_bounds(requested_bounds, tiff_bounds):
     return (min_lon, min_lat, max_lon, max_lat)
 
 @st.cache_data
-def load_and_downsample_tiff(tiff_path, downsample_factor=2):
+def load_and_downsample_tiff(tiff_path, downsample_factor=4):
     """Load TIFF file with downsampling to manage memory"""
     try:
+        # Check memory before loading
+        current_memory = get_memory_usage()
+        st.write(f"Memory usage before loading: {current_memory:.1f}MB")
+        
         with rasterio.open(tiff_path) as src:
             # Read metadata
             width = src.width
@@ -201,24 +205,48 @@ def load_and_downsample_tiff(tiff_path, downsample_factor=2):
             window_width = width // downsample_factor
             window_height = height // downsample_factor
             
-            # Read downsampled data
+            # Read downsampled data with memory optimization
             data = src.read(
                 1,
                 out_shape=(1, window_height, window_width),
-                resampling=rasterio.enums.Resampling.average
+                resampling=rasterio.enums.Resampling.average,
+                masked=True  # Use masked arrays to handle NaN values
             )
             
             # Ensure proper shape and squeeze out single-dimensional axes
             data = np.squeeze(data)
             
+            # Convert masked array to regular array, replacing masked values with NaN
+            if hasattr(data, 'mask'):
+                data = data.filled(np.nan)
+            
             # Debug information
             st.write(f"Data loaded with shape: {data.shape}, using downsample factor: {downsample_factor}")
             st.write(f"Memory usage after load: {get_memory_usage():.1f}MB")
             
+            # Force garbage collection
+            gc.collect()
+            
             return data, src.bounds
+            
     except Exception as e:
         st.error(f"Error in load_and_downsample_tiff: {str(e)}")
+        # Force garbage collection on error
+        gc.collect()
         raise
+
+# Add this helper function to check memory before heavy operations
+def check_memory_before_operation(operation_name, threshold_mb=1000):
+    """Check if we have enough memory before a heavy operation"""
+    current_memory = get_memory_usage()
+    if current_memory > threshold_mb:
+        st.warning(f"High memory usage ({current_memory:.1f}MB) before {operation_name}. Forcing garbage collection.")
+        gc.collect()
+        current_memory = get_memory_usage()
+        if current_memory > threshold_mb:
+            st.error(f"Insufficient memory for {operation_name}. Please try reducing the data size.")
+            return False
+    return True
 
 def create_ridge_plot_optimized(values, title=None, max_lines=200):
     """Create ridge map with memory optimization"""
@@ -362,6 +390,11 @@ if location_data:
         # Get TIFF file based on the view bounds center point
         center_lat = (requested_bounds[1] + requested_bounds[3]) / 2
         center_lon = (requested_bounds[0] + requested_bounds[2]) / 2
+        
+        # Check memory before loading TIFF
+        if not check_memory_before_operation("loading TIFF file"):
+            st.stop()
+            
         tiff_path, downsample_factor = s3_handler.get_tiff_path(center_lat, center_lon)
             
         if not tiff_path:
@@ -389,10 +422,11 @@ if location_data:
                 with col1:
                     st.subheader("Original Region")
                     # Original DEM plot
-                    fig_dem = create_dem_plot(data, bounds, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
-                    if fig_dem:
-                        st.pyplot(fig_dem)
-                        plt.close(fig_dem)
+                    if check_memory_before_operation("creating DEM plot"):
+                        fig_dem = create_dem_plot(data, bounds, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
+                        if fig_dem:
+                            st.pyplot(fig_dem)
+                            plt.close(fig_dem)
                     graphs_completed += 1
                     progress_bar.progress(graphs_completed/total_graphs)
                     
@@ -402,10 +436,11 @@ if location_data:
                         gc.collect()
                     
                     # Ridge plot
-                    fig_ridge = create_ridge_plot_optimized(data, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
-                    if fig_ridge:
-                        st.pyplot(fig_ridge)
-                        plt.close(fig_ridge)
+                    if check_memory_before_operation("creating ridge plot"):
+                        fig_ridge = create_ridge_plot_optimized(data, f"Full Region\n{format_coordinates(center_lat, center_lon)}")
+                        if fig_ridge:
+                            st.pyplot(fig_ridge)
+                            plt.close(fig_ridge)
                     graphs_completed += 1
                     progress_bar.progress(graphs_completed/total_graphs)
                     
@@ -415,11 +450,12 @@ if location_data:
                         gc.collect()
                     
                     # 3D surface plot
-                    plot_data = downsample_for_3d(data)
-                    if s3_handler.resource_manager.check_memory():
-                        fig_3d = create_3d_plot(plot_data, bounds)
-                        if fig_3d:
-                            st.plotly_chart(fig_3d)
+                    if check_memory_before_operation("creating 3D plot"):
+                        plot_data = downsample_for_3d(data)
+                        if s3_handler.resource_manager.check_memory():
+                            fig_3d = create_3d_plot(plot_data, bounds)
+                            if fig_3d:
+                                st.plotly_chart(fig_3d)
                         graphs_completed += 1
                         progress_bar.progress(graphs_completed/total_graphs)
                     else:
@@ -437,6 +473,10 @@ if location_data:
                         adj_center_lat = (adjusted_bounds[3] + adjusted_bounds[1]) / 2
                         adj_center_lon = (adjusted_bounds[2] + adjusted_bounds[0]) / 2
                         
+                        # Check memory before processing adjusted region
+                        if not check_memory_before_operation("processing adjusted region"):
+                            st.stop()
+                            
                         # Re-open the TIFF file to use mask operation
                         with rasterio.open(tiff_path) as src:
                             # Get adjusted image using mask operation
@@ -452,12 +492,13 @@ if location_data:
                                 })
                                 
                                 # Adjusted DEM plot
-                                fig_adj_dem = create_dem_plot(out_image[0], 
-                                                            adjusted_bounds_obj,
-                                                            f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
-                                if fig_adj_dem:
-                                    st.pyplot(fig_adj_dem)
-                                    plt.close(fig_adj_dem)
+                                if check_memory_before_operation("creating adjusted DEM plot"):
+                                    fig_adj_dem = create_dem_plot(out_image[0], 
+                                                                adjusted_bounds_obj,
+                                                                f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
+                                    if fig_adj_dem:
+                                        st.pyplot(fig_adj_dem)
+                                        plt.close(fig_adj_dem)
                                 graphs_completed += 1
                                 progress_bar.progress(graphs_completed/total_graphs)
                                 
@@ -467,11 +508,12 @@ if location_data:
                                     gc.collect()
                                 
                                 # Adjusted ridge plot
-                                fig_adj_ridge = create_ridge_plot_optimized(out_image[0], 
-                                                                          f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
-                                if fig_adj_ridge:
-                                    st.pyplot(fig_adj_ridge)
-                                    plt.close(fig_adj_ridge)
+                                if check_memory_before_operation("creating adjusted ridge plot"):
+                                    fig_adj_ridge = create_ridge_plot_optimized(out_image[0], 
+                                                                              f"Selected Region\n{format_coordinates(adj_center_lat, adj_center_lon)}")
+                                    if fig_adj_ridge:
+                                        st.pyplot(fig_adj_ridge)
+                                        plt.close(fig_adj_ridge)
                                 graphs_completed += 1
                                 progress_bar.progress(graphs_completed/total_graphs)
                                 
@@ -481,11 +523,12 @@ if location_data:
                                     gc.collect()
                                 
                                 # Adjusted 3D plot
-                                plot_data = downsample_for_3d(out_image[0])
-                                if s3_handler.resource_manager.check_memory():
-                                    fig_adj_3d = create_3d_plot(plot_data, adjusted_bounds_obj)
-                                    if fig_adj_3d:
-                                        st.plotly_chart(fig_adj_3d)
+                                if check_memory_before_operation("creating adjusted 3D plot"):
+                                    plot_data = downsample_for_3d(out_image[0])
+                                    if s3_handler.resource_manager.check_memory():
+                                        fig_adj_3d = create_3d_plot(plot_data, adjusted_bounds_obj)
+                                        if fig_adj_3d:
+                                            st.plotly_chart(fig_adj_3d)
                                     graphs_completed += 1
                                     progress_bar.progress(graphs_completed/total_graphs)
                                 else:

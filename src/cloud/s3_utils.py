@@ -14,12 +14,13 @@ class ResourceManager:
     def __init__(self, memory_limit_mb: Optional[float] = None):
         """
         Initialize resource manager with optional memory limit.
-        If no limit provided, uses 75% of system memory.
+        If no limit provided, uses 50% of system memory to be conservative.
         """
         self.system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
-        self.memory_limit = memory_limit_mb or self.system_memory * 0.75
+        # Be more conservative with memory usage - use 50% of system memory
+        self.memory_limit = memory_limit_mb or self.system_memory * 0.5
         self.lock = threading.Lock()
-        self._cleanup_threshold = self.memory_limit * 0.9  # 90% of limit
+        self._cleanup_threshold = self.memory_limit * 0.8  # 80% of limit
         
     def get_available_memory(self) -> float:
         """Get available memory in MB"""
@@ -37,13 +38,15 @@ class ResourceManager:
         with self.lock:
             used = self.get_used_memory()
             if used > self.memory_limit:
+                st.warning(f"Memory usage ({used:.1f}MB) exceeds limit ({self.memory_limit:.1f}MB)")
                 return False
             return True
     
-    def estimate_tiff_memory(self, file_size_mb: float, processing_factor: float = 2.5) -> float:
+    def estimate_tiff_memory(self, file_size_mb: float, processing_factor: float = 3.0) -> float:
         """
         Estimate memory needed for TIFF processing.
         processing_factor accounts for temporary copies during processing.
+        Using a higher factor to be more conservative.
         """
         return file_size_mb * processing_factor
     
@@ -55,12 +58,13 @@ class ResourceManager:
         estimated_memory = self.estimate_tiff_memory(file_size_mb)
         available_memory = self.get_available_memory()
         
-        if estimated_memory < available_memory * 0.8:  # Leave 20% buffer
+        # Be more conservative - leave 40% buffer
+        if estimated_memory < available_memory * 0.6:
             return True, 1
         
         # Calculate downsample factor needed
-        downsample_factor = int(np.ceil(np.sqrt(estimated_memory / (available_memory * 0.8))))
-        return False, max(2, downsample_factor)  # Minimum downsample factor of 2
+        downsample_factor = int(np.ceil(np.sqrt(estimated_memory / (available_memory * 0.6))))
+        return False, max(4, downsample_factor)  # Minimum downsample factor of 4
 
 class S3Handler:
     def __init__(self, bucket_name, region_name):
