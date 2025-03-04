@@ -7,6 +7,7 @@
 * `git clone "Your-repository"`
 * `sudo apt install python3 python3-pip`
 * `sudo apt install python-is-python3`
+* `sudo apt install python3.12-venv`
 * `sudo apt install -y libgl1 mesa-utils xvfb`
 * `sudo apt-get install -y gdal-bin libgdal-dev`
 * `sudo apt-get install gmt gmt-dcw gmt-gshhg`
